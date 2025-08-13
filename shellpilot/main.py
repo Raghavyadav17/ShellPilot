@@ -4,6 +4,7 @@ ShellPilot - AI-Powered Linux System Administration CLI
 """
 
 import typer
+import time
 from typing import Optional
 from enum import Enum
 import sys
@@ -11,9 +12,10 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich import print
-
+from dataclasses import dataclass, asdict   # ✅ Correct
 from shellpilot import __version__
 from shellpilot.config import Config, get_config
+from shellpilot.core.session import get_session_store
 
 # Initialize rich console
 console = Console()
@@ -62,14 +64,15 @@ def common(
     """ShellPilot - AI-Powered Linux System Administration"""
     pass
 
+
 @app.command()
 def run(
     query: str = typer.Argument(
         ...,
         help="Query or command to execute"
     ),
-    provider: Optional[LLMProvider] = typer.Option(  # FIXED: Made optional
-        None,  # FIXED: Default to None instead of LLMProvider.openai
+    provider: Optional[LLMProvider] = typer.Option(
+        None,
         "--provider", "-p",
         help="LLM provider to use"
     ),
@@ -92,10 +95,15 @@ def run(
         False,
         "--dry-run", "-n",
         help="Show what would be executed without running commands"
+    ),
+    clear_context: bool = typer.Option(
+        False,
+        "--clear-context",
+        help="Clear session context before running"
     )
 ):
     """
-    Execute a single query or command using AI
+    Execute a single query or command using AI with session memory
 
     Examples:
     \b
@@ -103,9 +111,19 @@ def run(
         shellpilot run "install nginx" --provider deepseek
         shellpilot run "clean up logs" --unsafe
         shellpilot run "show disk usage" --dry-run
+        shellpilot run "continue from where we left off" --clear-context
     """
+    start_time = time.time()
+
     try:
-        # Load configuration first
+        # Initialize session store
+        session_store = get_session_store()
+
+        # Clear context if requested
+        if clear_context:
+            session_store.clear_session()
+
+        # Load configuration
         config = get_config()
 
         # Override config with CLI options if provided
@@ -118,18 +136,20 @@ def run(
         actual_provider = config.get_default_provider()
         actual_model = config.get_default_model() or "default"
 
-        # Show header with CORRECT provider from config
+        # Show header with session info
+        session_info = session_store.get_session_info()
         console.print(Panel(
             f"[bold green]ShellPilot[/bold green] v{__version__}\n"
-            f"[cyan]Provider:[/cyan] {actual_provider}\n"  # FIXED: Use actual_provider
+            f"[cyan]Provider:[/cyan] {actual_provider}\n"
             f"[cyan]Model:[/cyan] {actual_model}\n"
             f"[cyan]Safe Mode:[/cyan] {'✅ Enabled' if safe_mode else '❌ Disabled'}\n"
-            f"[cyan]Dry Run:[/cyan] {'✅ Yes' if dry_run else '❌ No'}",
+            f"[cyan]Dry Run:[/cyan] {'✅ Yes' if dry_run else '❌ No'}\n"
+            f"[dim]Session: {session_info['session_id']} | Commands: {session_info['total_commands']}[/dim]",
             title="🚁 AI System Administration",
             border_style="green"
         ))
 
-        # FIXED: Import and use our core modules
+        # Import core modules
         from shellpilot.core.llm import LLMManager
         from shellpilot.core.executor import CommandExecutor
 
@@ -137,9 +157,15 @@ def run(
         llm_manager = LLMManager(config)
         executor = CommandExecutor(safe_mode=safe_mode, dry_run=dry_run)
 
-        # Generate commands using AI
+        # Get session context for AI
+        context = session_store.get_context_summary()
+
+        # Generate commands using AI with context
         console.print(f"[cyan]🤖 Analyzing:[/cyan] {query}")
-        llm_response = llm_manager.generate_command(query)
+        if context and "No previous commands" not in context:
+            console.print(f"[dim]📋 Using session context ({len(session_store.get_recent_commands())} recent commands)[/dim]")
+
+        llm_response = llm_manager.generate_command(query, context if context else None)
 
         if not llm_response.commands:
             console.print("[yellow]No commands generated.[/yellow]")
@@ -149,6 +175,15 @@ def run(
                     title="🤖 AI Response",
                     border_style="yellow"
                 ))
+
+            # Still record the query attempt
+            session_store.add_command(
+                query=query,
+                commands=[],
+                success=False,
+                ai_summary="No commands generated",
+                execution_time=time.time() - start_time
+            )
             return
 
         # Show AI response
@@ -165,9 +200,30 @@ def run(
 
         results = executor.execute_multiple(llm_response.commands)
 
-        # Summary
+        # Calculate success
         successful = sum(1 for r in results if r.success)
+        overall_success = successful == len(results)
+
+        # Create AI summary of what was accomplished
+        ai_summary = f"Executed {successful}/{len(results)} commands successfully"
+        if llm_response.content:
+            # Extract a brief summary from AI response (first sentence)
+            first_sentence = llm_response.content.split('.')[0]
+            if len(first_sentence) < 100:
+                ai_summary = first_sentence.strip()
+
+        # Record in session
+        session_store.add_command(
+            query=query,
+            commands=llm_response.commands,
+            success=overall_success,
+            ai_summary=ai_summary,
+            execution_time=time.time() - start_time
+        )
+
+        # Summary
         console.print(f"\n[green]✅ {successful}/{len(results)} commands executed successfully[/green]")
+        console.print(f"[dim]📝 Session updated | Total commands this session: {session_store.get_session_info()['total_commands']}[/dim]")
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Operation cancelled by user[/yellow]")
@@ -175,8 +231,81 @@ def run(
     except Exception as e:
         console.print(f"\n[red]❌ Error: {str(e)}[/red]")
         import traceback
-        console.print(f"[dim]{traceback.format_exc()}[/dim]")  # Debug info
+        console.print(f"[dim]{traceback.format_exc()}[/dim]")
         raise typer.Exit(1)
+
+
+
+@app.command()
+def context(
+    show_full: bool = typer.Option(
+        False,
+        "--full",
+        help="Show full session history"
+    ),
+    clear: bool = typer.Option(
+        False,
+        "--clear",
+        help="Clear session context"
+    )
+):
+    """
+    Show or manage session context
+
+    Examples:
+    \b
+        shellpilot context              # Show recent commands
+        shellpilot context --full       # Show full session history
+        shellpilot context --clear      # Clear session memory
+    """
+    session_store = get_session_store()
+
+    if clear:
+        session_store.clear_session()
+        return
+
+    session_info = session_store.get_session_info()
+
+    # Show session header
+    console.print(Panel(
+        f"[bold blue]Session Information[/bold blue]\n"
+        f"[cyan]Session ID:[/cyan] {session_info['session_id']}\n"
+        f"[cyan]Started:[/cyan] {session_info['start_time']}\n"
+        f"[cyan]Total Commands:[/cyan] {session_info['total_commands']}\n"
+        f"[cyan]Current Directory:[/cyan] {session_info['current_working_dir']}\n"
+        f"[cyan]Last Updated:[/cyan] {session_info['last_updated']}",
+        title="🧠 Session Context",
+        border_style="blue"
+    ))
+
+    # Show command history
+    recent_commands = session_store.get_recent_commands(20 if show_full else 10)
+
+    if not recent_commands:
+        console.print("[dim]No commands in session history[/dim]")
+        return
+
+    console.print(f"\n[bold]Recent Commands ({'Full History' if show_full else 'Last 10'}):[/bold]\n")
+
+    for i, cmd in enumerate(recent_commands, 1):
+        status_icon = "✅" if cmd.success else "❌"
+        timestamp = cmd.timestamp.split('T')[1][:8]  # Just time portion
+
+        console.print(f"{i:2d}. {status_icon} [{timestamp}] [cyan]{cmd.query}[/cyan]")
+
+        # Show commands executed
+        for j, command in enumerate(cmd.commands[:3]):  # Show max 3 commands
+            console.print(f"    └─ [dim]{command}[/dim]")
+        if len(cmd.commands) > 3:
+            console.print(f"    └─ [dim]... and {len(cmd.commands) - 3} more[/dim]")
+
+        # Show AI summary if available
+        if cmd.ai_summary:
+            console.print(f"    [dim italic]Summary: {cmd.ai_summary}[/dim italic]")
+
+        console.print()  # Empty line between commands
+
+
 
 @app.command()
 def chat(

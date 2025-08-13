@@ -169,10 +169,17 @@ class LLMManager:
 
         return self._provider
 
-    def generate_command(self, query: str) -> LLMResponse:
-        """Generate command using the configured provider"""
+    def generate_command(self, query: str, context: Optional[str] = None) -> LLMResponse:
+        """Generate command using the configured provider with optional context"""
         provider = self.get_provider()
-        return provider.generate_command(query)
+
+        # Add context to the query if provided
+        if context:
+            enhanced_query = f"{context}\n\nNew Request: {query}"
+        else:
+            enhanced_query = query
+
+        return provider.generate_command(enhanced_query)
 
     def test_connection(self) -> bool:
         """Test if the provider is working"""
