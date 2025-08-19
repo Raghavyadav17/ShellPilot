@@ -12,10 +12,12 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich import print
-from dataclasses import dataclass, asdict   # ✅ Correct
+from dataclasses import dataclass, asdict
+
 from shellpilot import __version__
 from shellpilot.config import Config, get_config
 from shellpilot.core.session import get_session_store
+from shellpilot.core.workflow import WorkflowEngine
 
 # Initialize rich console
 console = Console()
@@ -64,7 +66,6 @@ def common(
     """ShellPilot - AI-Powered Linux System Administration"""
     pass
 
-
 @app.command()
 def run(
     query: str = typer.Argument(
@@ -100,6 +101,11 @@ def run(
         False,
         "--clear-context",
         help="Clear session context before running"
+    ),
+    workflow_mode: bool = typer.Option(
+        False,
+        "--workflow", "-w",
+        help="Execute as intelligent multi-step workflow"
     )
 ):
     """
@@ -112,6 +118,7 @@ def run(
         shellpilot run "clean up logs" --unsafe
         shellpilot run "show disk usage" --dry-run
         shellpilot run "continue from where we left off" --clear-context
+        shellpilot run "set up web server" --workflow
     """
     start_time = time.time()
 
@@ -144,6 +151,7 @@ def run(
             f"[cyan]Model:[/cyan] {actual_model}\n"
             f"[cyan]Safe Mode:[/cyan] {'✅ Enabled' if safe_mode else '❌ Disabled'}\n"
             f"[cyan]Dry Run:[/cyan] {'✅ Yes' if dry_run else '❌ No'}\n"
+            f"[cyan]Workflow:[/cyan] {'🔄 Enabled' if workflow_mode else '📋 Standard'}\n"
             f"[dim]Session: {session_info['session_id']} | Commands: {session_info['total_commands']}[/dim]",
             title="🚁 AI System Administration",
             border_style="green"
@@ -193,21 +201,52 @@ def run(
             border_style="blue"
         ))
 
-        # Execute commands
-        console.print(f"\n[green]Generated {len(llm_response.commands)} command(s):[/green]")
-        for i, cmd in enumerate(llm_response.commands, 1):
-            console.print(f"  {i}. [cyan]{cmd}[/cyan]")
+        # Choose execution mode: Workflow vs Standard
+        if workflow_mode or len(llm_response.commands) > 6:
+            # WORKFLOW MODE for complex tasks
+            console.print(f"\n[blue]🔄 Workflow Mode:[/blue] {len(llm_response.commands)} commands → Intelligent workflow")
 
-        results = executor.execute_multiple(llm_response.commands)
+            # Initialize workflow components
+            from shellpilot.core.safety import SafetyChecker
+            safety_checker = SafetyChecker(safe_mode)
+            workflow_engine = WorkflowEngine(executor, safety_checker)
 
-        # Calculate success
-        successful = sum(1 for r in results if r.success)
-        overall_success = successful == len(results)
+            # Create workflow from AI response
+            workflow = workflow_engine.create_workflow_from_llm_response(
+                query,
+                llm_response,
+                ai_plan=llm_response.content
+            )
 
-        # Create AI summary of what was accomplished
-        ai_summary = f"Executed {successful}/{len(results)} commands successfully"
+            # Execute workflow
+            overall_success = workflow_engine.execute_workflow(
+                workflow,
+                interactive=(not dry_run and safe_mode)
+            )
+
+            # Calculate results for session tracking
+            successful_steps = sum(1 for step in workflow.steps if step.status.value == "success")
+            total_steps = len(workflow.steps)
+
+        else:
+            # STANDARD MODE for simple tasks
+            console.print(f"\n[green]📋 Standard Mode:[/green] {len(llm_response.commands)} commands")
+            for i, cmd in enumerate(llm_response.commands, 1):
+                console.print(f"  {i}. [cyan]{cmd}[/cyan]")
+
+            results = executor.execute_multiple(llm_response.commands)
+
+            # Calculate success
+            successful_steps = sum(1 for r in results if r.success)
+            total_steps = len(results)
+            overall_success = successful_steps == total_steps
+
+        # Create AI summary
+        mode_text = "workflow steps" if (workflow_mode or len(llm_response.commands) > 6) else "commands"
+        ai_summary = f"Executed {successful_steps}/{total_steps} {mode_text} successfully"
+
         if llm_response.content:
-            # Extract a brief summary from AI response (first sentence)
+            # Extract brief summary from AI response
             first_sentence = llm_response.content.split('.')[0]
             if len(first_sentence) < 100:
                 ai_summary = first_sentence.strip()
@@ -221,9 +260,10 @@ def run(
             execution_time=time.time() - start_time
         )
 
-        # Summary
-        console.print(f"\n[green]✅ {successful}/{len(results)} commands executed successfully[/green]")
-        console.print(f"[dim]📝 Session updated | Total commands this session: {session_store.get_session_info()['total_commands']}[/dim]")
+        # Final summary
+        mode_icon = "🔄" if (workflow_mode or len(llm_response.commands) > 6) else "📋"
+        console.print(f"\n[green]✅ {successful_steps}/{total_steps} {mode_text} executed successfully[/green]")
+        console.print(f"[dim]{mode_icon} Session updated | Total commands: {session_store.get_session_info()['total_commands']}[/dim]")
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Operation cancelled by user[/yellow]")
@@ -234,7 +274,197 @@ def run(
         console.print(f"[dim]{traceback.format_exc()}[/dim]")
         raise typer.Exit(1)
 
+@app.command()
+def workflow(
+    query: str = typer.Argument(
+        ...,
+        help="Complex task to execute as intelligent workflow"
+    ),
+    provider: Optional[LLMProvider] = typer.Option(
+        None,
+        "--provider", "-p",
+        help="LLM provider to use"
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model", "-m",
+        help="Specific model to use"
+    ),
+    safe_mode: bool = typer.Option(
+        True,
+        "--safe-mode/--unsafe",
+        help="Enable safety confirmations"
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run", "-n",
+        help="Show workflow plan without executing"
+    ),
+    auto_approve: bool = typer.Option(
+        False,
+        "--auto-approve", "-y",
+        help="Auto-approve non-critical steps"
+    )
+):
+    """
+    Execute complex multi-step workflows with intelligent planning
 
+    Examples:
+    \b
+        shellpilot workflow "set up NGINX with SSL certificate"
+        shellpilot workflow "secure Ubuntu server" --dry-run
+        shellpilot workflow "install Docker and containers" --auto-approve
+        shellpilot workflow "backup and optimize system"
+    """
+    start_time = time.time()
+
+    try:
+        # Initialize components
+        session_store = get_session_store()
+        config = get_config()
+
+        # Override config with CLI options
+        if provider:
+            config.set_default_provider(provider.value)
+        if model:
+            config.set_default_model(model)
+
+        # Show workflow header
+        console.print(Panel(
+            f"[bold blue]🔄 ShellPilot Workflow Engine[/bold blue] v{__version__}\n"
+            f"[cyan]Provider:[/cyan] {config.get_default_provider()}\n"
+            f"[cyan]Model:[/cyan] {config.get_default_model() or 'default'}\n"
+            f"[cyan]Mode:[/cyan] {'🔍 Planning' if dry_run else '⚡ Execution'}\n"
+            f"[cyan]Safety:[/cyan] {'✅ Interactive' if safe_mode and not auto_approve else '🚀 Auto-approve'}",
+            title="🧠 Intelligent Multi-Step Workflows",
+            border_style="blue"
+        ))
+
+        # Import core modules
+        from shellpilot.core.llm import LLMManager
+        from shellpilot.core.executor import CommandExecutor
+        from shellpilot.core.safety import SafetyChecker
+        from shellpilot.core.workflow import WorkflowEngine
+
+        # Initialize workflow system
+        llm_manager = LLMManager(config)
+        safety_checker = SafetyChecker(safe_mode)
+        executor = CommandExecutor(safe_mode=safe_mode, dry_run=dry_run)
+        workflow_engine = WorkflowEngine(executor, safety_checker)
+
+        # Get session context
+        context = session_store.get_context_summary()
+
+        # Enhanced prompt for better workflow planning
+        workflow_prompt = f"""
+MULTI-STEP WORKFLOW PLANNING:
+
+Task: {query}
+
+Please create a comprehensive step-by-step plan for this complex task. Structure your response with clear phases:
+
+### Step 1: [Phase Name]
+Brief description of what this phase accomplishes.
+```bash
+command1
+command2
+```
+
+### Step 2: [Phase Name]
+Brief description of what this phase accomplishes.
+```bash
+command3
+command4
+```
+
+Important considerations:
+1. Break down into logical, sequential phases
+2. Each step should have clear dependencies
+3. Include verification commands where appropriate
+4. Consider error handling and rollback scenarios
+5. Use safe, standard Linux practices
+6. Include explanations for complex operations
+
+Context from recent session:
+{context if context and "No previous commands" not in context else "No previous session context."}
+"""
+
+        # Generate comprehensive workflow plan
+        console.print(f"[cyan]🧠 Planning multi-step workflow:[/cyan] {query}")
+        console.print("[dim]Analyzing task complexity and dependencies...[/dim]")
+
+        llm_response = llm_manager.generate_command(workflow_prompt)
+
+        if not llm_response.commands:
+            console.print("[yellow]❌ Could not generate workflow plan.[/yellow]")
+            console.print("[dim]Try rephrasing your request or breaking it into smaller tasks.[/dim]")
+            return
+
+        # Show comprehensive AI analysis
+        console.print(Panel(
+            llm_response.content,
+            title="🧠 Workflow Intelligence & Planning",
+            border_style="blue"
+        ))
+
+        # Create intelligent workflow
+        workflow = workflow_engine.create_workflow_from_llm_response(
+            query,
+            llm_response,
+            ai_plan=llm_response.content
+        )
+
+        console.print(f"\n[green]🎯 Generated workflow with {len(workflow.steps)} intelligent steps[/green]")
+
+        if dry_run:
+            # DRY RUN: Show plan only
+            console.print("\n[yellow]🔍 DRY RUN MODE - Workflow Plan Preview[/yellow]")
+            workflow_engine._display_workflow_plan(workflow)
+
+            console.print(f"\n[blue]💡 To execute this workflow:[/blue]")
+            console.print(f"[cyan]shellpilot workflow \"{query}\"[/cyan]")
+
+            # Record planning in session
+            session_store.add_command(
+                query=f"[WORKFLOW PLAN] {query}",
+                commands=llm_response.commands,
+                success=True,
+                ai_summary=f"Planned {len(workflow.steps)} step workflow",
+                execution_time=time.time() - start_time
+            )
+        else:
+            # EXECUTE: Run the workflow
+            success = workflow_engine.execute_workflow(
+                workflow,
+                interactive=(not auto_approve and safe_mode)
+            )
+
+            # Record execution in session
+            successful_steps = sum(1 for step in workflow.steps if step.status.value == "success")
+            session_store.add_command(
+                query=f"[WORKFLOW] {query}",
+                commands=llm_response.commands,
+                success=success,
+                ai_summary=f"Executed {successful_steps}/{len(workflow.steps)} workflow steps",
+                execution_time=time.time() - start_time
+            )
+
+            # Final success message
+            if success:
+                console.print(f"\n[bold green]🎉 Workflow completed successfully![/bold green]")
+                console.print(f"[green]✅ All {len(workflow.steps)} steps executed without errors[/green]")
+            else:
+                console.print(f"\n[yellow]⚠️  Workflow completed with some issues[/yellow]")
+                console.print(f"[cyan]💡 Check individual step results above[/cyan]")
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]⚠️  Workflow cancelled by user[/yellow]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"\n[red]❌ Workflow error: {str(e)}[/red]")
+        import traceback
+        console.print(f"[dim]{traceback.format_exc()}[/dim]")
+        raise typer.Exit(1)
 
 @app.command()
 def context(
@@ -305,12 +535,10 @@ def context(
 
         console.print()  # Empty line between commands
 
-
-
 @app.command()
 def chat(
-    provider: Optional[LLMProvider] = typer.Option(  # FIXED: Made optional
-        None,  # FIXED: Default to None
+    provider: Optional[LLMProvider] = typer.Option(
+        None,
         "--provider", "-p",
         help="LLM provider to use"
     ),
